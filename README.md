@@ -21,7 +21,7 @@ Features
 - Example MCP server demonstrating domain adapters (weather, checkpoints)
 
 Prerequisites
-- Python 3.10+ (recommended)
+- Python 3.13+ (recommended)
 - Git (to clone the repo)
 - A virtual environment tool (venv) or similar
 
