@@ -61,7 +61,25 @@ if not GROQ_API_KEY:
 llm = ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=GROQ_API_KEY,
+    max_tokens=2000,          # Groq counts requested output toward the TPM limit
+    reasoning_effort="low",   # gpt-oss is a reasoning model; less hidden "thinking" = fewer tokens
+    max_retries=4,
 )
+
+# Small, fast model for cheap steps (guardrail, supervisor routing).
+# Groq limits are tracked per model, so this also spreads load across TPM buckets.
+light_llm = ChatGroq(
+    model=os.getenv("LIGHT_MODEL", "qwen/qwen3.8-27b"),
+    api_key=GROQ_API_KEY,
+    max_tokens=600,
+    max_retries=4,
+)
+
+
+def clip(value, limit: int = 2000) -> str:
+    """Keep tool/agent output small so no single request blows the TPM limit."""
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit] + " ...[truncated]"
 
 # =========================
 # State - original fields kept, new control fields added
@@ -114,7 +132,7 @@ AGENT_ORDER = [
 
 
 def _llm_text(system_prompt: str, user_prompt: str) -> str:
-    response = llm.invoke(
+    response = light_llm.invoke(
         [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt),
@@ -300,11 +318,8 @@ You are a travel flight expert.
 User Query:
 {query}
 
-Airport Information:
-{airport_data}
-
-Airline Information:
-{airline_data}
+Live web search results about flights for this trip:
+{search_data}
 
 Generate:
 1. Likely departure airport
@@ -315,6 +330,8 @@ Generate:
 6. Peak season pricing warning
 7. Booking advice
 
+Use the search results when they contain useful details. If they do not, use
+general knowledge and clearly label those parts as approximate.
 Return concise travel guidance.
 """
 
@@ -323,23 +340,30 @@ def flight_agent(state: TravelState):
     print("\nINSIDE FLIGHT AGENT\n")
     query = state["user_query"]
 
+    # AviationStack's free plan does not allow list_airports / list_airlines
+    # (function_access_restricted), so flight info now comes from Tavily search.
     try:
-        airports = asyncio.run(aviation_mcp_call("list_airports"))
-        airlines = asyncio.run(aviation_mcp_call("list_airlines"))
-
-        print("\nAIRPORTS:", airports)
-        print("\nAIRLINES:", airlines)
-
-        prompt = FLIGHT_AGENT_PROMPT.format(
-            query=query,
-            airport_data=str(airports)[:3000],
-            airline_data=str(airlines)[:3000],
+        search_data = clip(
+            asyncio.run(
+                tavily_mcp_search(
+                    f"flights airlines typical duration price {query}"
+                )
+            ),
+            3000,
         )
+    except Exception as exc:
+        print(f"FLIGHT AGENT SEARCH ERROR: {type(exc).__name__}: {exc}", flush=True)
+        search_data = "Live flight search is unavailable. Use general knowledge only."
 
+    try:
         response = llm.invoke(
             [
                 SystemMessage(content="You are an expert travel flight planner."),
-                HumanMessage(content=prompt),
+                HumanMessage(
+                    content=FLIGHT_AGENT_PROMPT.format(
+                        query=query, search_data=search_data
+                    )
+                ),
             ]
         )
         flight_data = response.content
@@ -363,8 +387,8 @@ def hotel_agent(state: TravelState):
     )
 
     try:
-        hotel_results = asyncio.run(
-            tavily_mcp_search(query)
+        hotel_results = clip(
+            asyncio.run(tavily_mcp_search(query)), 3000
         )
 
     except Exception as exc:
@@ -413,10 +437,10 @@ def weather_agent(state: TravelState):
 
         weather_results = f"""
 Current Weather:
-{weather_data}
+{clip(weather_data, 800)}
 
 Forecast:
-{forecast_data}
+{clip(forecast_data, 1500)}
 """
 
     except Exception as exc:
@@ -457,13 +481,13 @@ Trip Constraints:
 {state.get('trip_constraints', {})}
 
 Flight Results:
-{state.get('flight_results', '')}
+{clip(state.get('flight_results', ''), 1500)}
 
 Hotel Results:
-{state.get('hotel_results', '')}
+{clip(state.get('hotel_results', ''), 1500)}
 
 Weather Results:
-{state.get('weather_results', '')}
+{clip(state.get('weather_results', ''), 800)}
 
 Return:
 1. Estimated cost categories
@@ -502,16 +526,16 @@ Trip Constraints:
 {state.get('trip_constraints', {})}
 
 Flight Results:
-{state.get('flight_results', '')}
+{clip(state.get('flight_results', ''), 1500)}
 
 Hotel Results:
-{state.get('hotel_results', '')}
+{clip(state.get('hotel_results', ''), 1500)}
 
 Weather Results:
-{state.get('weather_results', '')}
+{clip(state.get('weather_results', ''), 800)}
 
 Budget Results:
-{state.get('budget_results', '')}
+{clip(state.get('budget_results', ''), 1500)}
 
 Make the itinerary practical, budget-aware, and easy to follow.
 Create a clear draft that is ready for human review.
@@ -592,20 +616,20 @@ User Request:
 Supervisor Constraints:
 {state.get('trip_constraints', {})}
 
-Flights:
-{state.get('flight_results', '')}
+Flights (summary):
+{clip(state.get('flight_results', ''), 1000)}
 
-Hotels:
-{state.get('hotel_results', '')}
+Hotels (summary):
+{clip(state.get('hotel_results', ''), 1000)}
 
-Weather:
-{state.get('weather_results', '')}
+Weather (summary):
+{clip(state.get('weather_results', ''), 600)}
 
 Budget Analysis:
-{state.get('budget_results', '')}
+{clip(state.get('budget_results', ''), 1200)}
 
 Draft Itinerary:
-{state.get('itinerary', '')}
+{clip(state.get('itinerary', ''), 3500)}
 
 Format the final answer beautifully using these sections:
 1. Trip Summary

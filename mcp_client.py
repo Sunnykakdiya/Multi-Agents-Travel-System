@@ -65,9 +65,12 @@ def _subprocess_env(**updates: str | None) -> dict[str, str]:
 # LLM
 # =========================================================
 
+# Destination extraction is a tiny task: use the light model, short output.
 llm = ChatGroq(
-    model="openai/gpt-oss-120b",
+    model=os.getenv("LIGHT_MODEL", "qwen/qwen3.8-27b"),
     api_key=_require_env("GROQ_API_KEY", GROQ_API_KEY),
+    max_tokens=50,
+    max_retries=4,
 )
 
 
